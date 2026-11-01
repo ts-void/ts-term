@@ -1,5 +1,7 @@
 # Requirements Specification: Lightweight Terminal Emulator in Rust
 
+**Working name: ts-term**
+
 **Technical Specification · Version 1.0 · 2026-10-31**
 
 ## 1. Goal and Motivation
