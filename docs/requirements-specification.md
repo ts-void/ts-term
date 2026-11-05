@@ -6,7 +6,7 @@
 
 ## 1. Goal and Motivation
 
-The goal is to develop a custom, lightweight terminal emulator in Rust that is functionally and architecturally modeled on projects such as [foot](https://codeberg.org/dnkl/foot) and [Alacritty](https://github.com/alacritty/alacritty).
+The goal is to develop a custom, lightweight terminal emulator in Rust that is functionally and architecturally modeled on projects such as [foot](https://codeberg.org/dnkl/foot).
 
 The focus is on:
 
