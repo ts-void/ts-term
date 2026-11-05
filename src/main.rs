@@ -1,96 +1,145 @@
-use std::ffi::CString;
-use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
-use std::process;
+use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut master: libc::c_int = 0;
-    let mut slave: libc::c_int = 0;
+use rustix::event::{poll, PollFd, PollFlags};
+use rustix::fs::{open, Mode, OFlags};
+use rustix::io::Errno;
+use rustix::process::{ioctl_tiocsctty, setsid};
+use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+use rustix::termios::{
+    tcgetattr, tcsetattr, tcsetwinsize, OptionalActions, Termios, Winsize,
+};
 
-    let res = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
+struct Pty {
+    master: OwnedFd,
+    child: Child,
+}
 
-    if res < 0 {
-        return Err("Failed to open PTY via libc::openpty".into());
-    }
+impl Pty {
+    fn spawn(rows: u16, cols: u16) -> io::Result<Self> {
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+        grantpt(&master)?;
+        unlockpt(&master)?;
+        tcsetwinsize(&master, Self::winsize(rows, cols))?;
 
-    let master_file = unsafe { std::fs::File::from_raw_fd(master) };
-    let slave_fd = slave;
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err("Failed to fork process".into());
-    }
-
-    if pid == 0 {
-        drop(master_file);
-
-        unsafe {
-            libc::setsid();
-            if libc::login_tty(slave_fd) < 0 {
-                libc::_exit(1);
-            }
-        }
+        let name = ptsname(&master, Vec::new())?;
+        let slave = open(name.as_c_str(), OFlags::RDWR | OFlags::NOCTTY, Mode::empty())?;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let c_shell = CString::new(shell)?;
-        let c_term = CString::new("TERM=xterm-256color")?;
-        let args = [c_shell.clone(), CString::new("-i")?];
-        let envs = [c_term];
-
-        let c_args: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-        let c_envs: Vec<*const libc::c_char> = envs.iter().map(|env| env.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+        let mut cmd = Command::new(shell);
+        cmd.env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
 
         unsafe {
-            libc::execve(c_shell.as_ptr(), c_args.as_ptr(), c_envs.as_ptr());
+            cmd.pre_exec(|| {
+                setsid()?;
+                ioctl_tiocsctty(rustix::stdio::stdin())?;
+                Ok(())
+            });
         }
+        let child = cmd.spawn()?;
+        Ok(Self { master, child })
+    }
 
-        process::exit(1);
-    } else {
-        unsafe {
-            libc::close(slave_fd);
+    fn winsize(rows: u16, cols: u16) -> Winsize {
+        Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 }
+    }
+
+    fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        Ok(tcsetwinsize(&self.master, Self::winsize(rows, cols))?)
+    }
+
+    fn write_all(&self, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            match rustix::io::write(&self.master, data) {
+                Ok(n) => data = &data[n..],
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
+        Ok(())
+    }
+}
 
-        println!("[Parent] PTY successfully opened. Listening for shell output...\n");
+struct RawMode(Termios);
 
-        let mut buf = [0u8; 1024];
-        let mut master_writer = master_file.try_clone()?;
+impl RawMode {
+    fn enable() -> io::Result<Self> {
+        let stdin = rustix::stdio::stdin();
+        let orig = tcgetattr(stdin)?;
+        let mut raw = orig.clone();
+        raw.make_raw();
+        tcsetattr(stdin, OptionalActions::Now, &raw)?;
+        Ok(Self(orig))
+    }
+}
 
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = master_writer.write_all(b"echo 'Hello from ts-term via PTY!'\n");
-            let _ = master_writer.write_all(b"ls -la\n");
-        });
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &self.0);
+    }
+}
 
-        let mut master_reader = master_file;
+fn main() -> io::Result<()> {
+    let mut pty = Pty::spawn(24, 80)?;
+    let _raw = RawMode::enable()?;
+    let stdin = rustix::stdio::stdin();
+    let stdout = rustix::stdio::stdout();
+    let mut buf = [0u8; 4096];
 
-        loop {
-            match master_reader.read(&mut buf) {
-                Ok(0) => {
-                    println!("\n[Parent] EOF reached (shell terminated).");
-                    break;
-                }
+    'main: loop {
+        let mut fds = [
+            PollFd::new(&stdin, PollFlags::IN),
+            PollFd::new(&pty.master, PollFlags::IN),
+        ];
+        match poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        let in_ev = fds[0].revents();
+        let pty_ev = fds[1].revents();
+
+        if in_ev.contains(PollFlags::IN) {
+            match rustix::io::read(stdin, &mut buf) {
+                Ok(0) => break 'main,
                 Ok(n) => {
-                    std::io::stdout().write_all(&buf[..n])?;
-                    std::io::stdout().flush()?;
+                    if buf[..n].contains(&0x1d) {
+                        break 'main;
+                    }
+                    pty.write_all(&buf[..n])?;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        if pty_ev.intersects(PollFlags::IN | PollFlags::HUP) {
+            match rustix::io::read(&pty.master, &mut buf) {
+                Ok(0) => break 'main,
+                Ok(n) => {
+                    eprintln!("pty: {n} bytes\r");
+                    let mut out = &buf[..n];
+                    while !out.is_empty() {
+                        match rustix::io::write(stdout, out) {
+                            Ok(w) => out = &out[w..],
+                            Err(Errno::INTR) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("\n[Read Error]: {e}");
-                    break;
-                }
+                Err(Errno::INTR) => {}
+                Err(Errno::IO) => break 'main,
+                Err(e) => return Err(e.into()),
             }
         }
     }
 
+    let _ = pty.child.kill();
+    pty.child.wait()?;
     Ok(())
 }
