@@ -1,6 +1,6 @@
 # ts-term
 
-A lightweight, Wayland-only terminal emulator written in Rust, inspired by [foot](https://codeberg.org/dnkl/foot) and [Alacritty](https://github.com/alacritty/alacritty).
+A lightweight, Wayland-only terminal emulator written in [Rust](https://rust-lang.org/), inspired by [foot](https://codeberg.org/dnkl/foot).
 
 > **Status:** Planning / early development. Nothing is usable yet.
 
@@ -15,15 +15,14 @@ It's a learning project, with the quiet hope that it will become a functional, l
 - Few external dependencies
 - Runs on both glibc and musl based Linux systems
 
+## Maybe later
+
+- Server/client mode (for now)
+
 ## Non-goals
 
 - X11 support
 - GPU acceleration
-- Server/client mode (for now)
-
-## Planned stack
-
-tba
 
 ## Documentation
 
